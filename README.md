@@ -1,5 +1,10 @@
 # 🫀 Holter IoT con ESP32 – Monitor ECG Portátil
 
+Integrantes:
+* Yuly Dayana Rodriguez 
+* Jacobo Andres Pacheco 
+* David Andres Casas 
+
 ## Visión del Proyecto
 
 Este proyecto consiste en el desarrollo de un **monitor cardíaco tipo Holter de bajo costo**, utilizando una **ESP32 y el sensor AD8232**, capaz de capturar señales ECG en tiempo real y transmitirlas para su visualización y análisis.
