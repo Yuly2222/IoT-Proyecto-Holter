@@ -26,7 +26,7 @@ Este sistema busca ofrecer una alternativa:
 - Proyectos de investigación en IoT y salud  
 
 ## Arquitectura y Restricciones
-
+![Arquitectura del sistema](arquitectura.png)
 
 ### Descripción de la arquitectura
 
