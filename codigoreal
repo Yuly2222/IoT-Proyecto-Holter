@@ -1,0 +1,88 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- CONFIGURACIÓN ---------------- //
+#define ECG_PIN 34      // AD8232 OUTPUT
+#define LO_PLUS 32      // Opcional
+#define LO_MINUS 33     // Opcional
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Buffer para gráfica
+int xPos = 0;
+
+// ---------------- SETUP ---------------- //
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+
+  // Inicializar I2C (OLED)
+  Wire.begin(21, 22);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error al iniciar OLED");
+    while (true);
+  }
+
+  display.clearDisplay();
+  
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("Ok");
+  display.display();
+
+  Serial.println("Sistema ECG iniciado...");
+}
+
+// ---------------- LOOP ---------------- //
+void loop() {
+
+  // Verificar si electrodos están conectados
+  if (digitalRead(LO_PLUS) == 1 || digitalRead(LO_MINUS) == 1) {
+    Serial.println("Electrodos desconectados");
+
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.println("Electrodos");
+    display.println("desconectados");
+    display.display();
+
+    delay(500);
+    return;
+  }
+
+  // Leer señal ECG
+  int ecgValue = analogRead(ECG_PIN);
+
+  // Enviar al Serial Plotter
+  Serial.println(ecgValue);
+
+  // Mapear valor para pantalla (ajusta si quieres)
+  int y = map(ecgValue, 0, 4095, SCREEN_HEIGHT, 0);
+
+  // Dibujar punto
+  display.drawPixel(xPos, y, WHITE);
+
+  xPos++;
+
+  // Cuando llega al final, limpia pantalla
+  if (xPos >= SCREEN_WIDTH) {
+    xPos = 0;
+    display.clearDisplay();
+  }
+
+  display.display();
+
+  // Frecuencia de muestreo ~250 Hz
+  delay(4);
+}
