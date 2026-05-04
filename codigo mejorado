@@ -1,0 +1,359 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+
+// -------- PINES -------- //
+#define ECG_PIN 34
+#define LO_PLUS 32
+#define LO_MINUS 33
+#define RESET_WIFI_BUTTON 25
+
+WebServer server(80);
+
+// -------- ECG -------- //
+int ecgValue = 0;
+int bpm = 0;
+
+unsigned long lastBeat = 0;
+int threshold = 2200;
+bool aboveThreshold = false;
+
+int beatCount = 0;
+unsigned long startTime = 0;
+
+// -------- BUFFER ECG -------- //
+#define BUFFER_SIZE 120
+
+int ecgBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1;
+
+// -------- DECLARACIONES -------- //
+void detectarLatido(int value);
+void configurarServidor();
+void verificarBotonResetWiFi();
+String obtenerEstadoElectrodos();
+void tomarMuestraECG();
+String generarBufferJSON();
+
+// -------- HTML -------- //
+String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Holter ECG</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  font-family: Arial;
+  background: #0f172a;
+  color: white;
+  text-align: center;
+}
+
+.dashboard {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.card {
+  background: #1e293b;
+  margin: 10px;
+  padding: 15px;
+  border-radius: 12px;
+  width: 150px;
+}
+
+.value {
+  font-size: 32px;
+  font-weight: bold;
+  color: #22c55e;
+}
+
+.chart-card {
+  background: #020617;
+  margin: 10px auto;
+  padding: 10px;
+  border-radius: 12px;
+  max-width: 700px;
+}
+
+button {
+  padding: 10px;
+  background: red;
+  color: white;
+  border: none;
+  border-radius: 8px;
+}
+</style>
+</head>
+
+<body>
+
+<h2>HOLTER ECG</h2>
+
+<div class="dashboard">
+  <div class="card">
+    <p>BPM</p>
+    <div class="value"><span id="bpm">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Pulsaciones</p>
+    <div class="value"><span id="beatCount">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Electrodos</p>
+    <div id="status">OK</div>
+  </div>
+
+  <div class="card">
+    <p>Tiempo</p>
+    <div><span id="uptime">0</span> s</div>
+  </div>
+</div>
+
+<div class="chart-card">
+  <canvas id="ecgChart" width="650" height="260"></canvas>
+</div>
+
+<button onclick="resetWiFi()">Reset WiFi</button>
+
+<script>
+let chart;
+let requesting = false;
+
+const MAX_POINTS = 1000;
+
+const initChart = () => {
+  const ctx = document.getElementById('ecgChart').getContext('2d');
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'ECG',
+        data: [],
+        borderColor: 'lime',
+        borderWidth: 1,
+        fill: false,
+        tension: 0,
+        pointRadius: 0
+      }]
+    },
+    options: {
+      animation: false,
+      responsive: true,
+      scales: {
+        x: { display: false },
+        y: { min: 0, max: 4095 }
+      }
+    }
+  });
+};
+
+const updateData = () => {
+  if (requesting) return;
+  requesting = true;
+
+  fetch("/data")
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById("bpm").innerText = data.bpm;
+      document.getElementById("beatCount").innerText = data.beatCount;
+      document.getElementById("status").innerText = data.electrodes;
+      document.getElementById("uptime").innerText = data.uptime;
+
+      data.samples.forEach(value => {
+        chart.data.labels.push("");
+        chart.data.datasets[0].data.push(value);
+      });
+
+      while (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+
+      chart.update("none");
+    })
+    .catch(error => {
+      console.log("Error:", error);
+    })
+    .finally(() => {
+      requesting = false;
+    });
+};
+
+const resetWiFi = () => {
+  fetch("/reset-wifi", { method: "POST" })
+    .then(res => res.json())
+    .then(data => alert(data.message));
+};
+
+window.onload = () => {
+  initChart();
+  updateData();
+
+  // Solo 2 peticiones por segundo
+  setInterval(updateData, 500);
+};
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// -------- SETUP -------- //
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+  pinMode(RESET_WIFI_BUTTON, INPUT_PULLUP);
+
+  startTime = millis();
+
+  WiFiManager wm;
+  bool res = wm.autoConnect("Holter-ECG", "12345678");
+
+  if (!res) {
+    ESP.restart();
+  }
+
+  Serial.print("IP ESP32: ");
+  Serial.println(WiFi.localIP());
+
+  configurarServidor();
+  server.begin();
+}
+
+// -------- LOOP -------- //
+void loop() {
+  server.handleClient();
+  verificarBotonResetWiFi();
+  tomarMuestraECG();
+}
+
+// -------- TOMA DE MUESTRAS CON BUFFER -------- //
+void tomarMuestraECG() {
+  unsigned long now = millis();
+
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = now;
+
+    ecgValue = analogRead(ECG_PIN);
+    detectarLatido(ecgValue);
+
+    ecgBuffer[bufferIndex] = ecgValue;
+    bufferIndex++;
+
+    if (bufferIndex >= BUFFER_SIZE) {
+      bufferIndex = 0;
+      bufferFull = true;
+    }
+  }
+}
+
+// -------- SERVIDOR -------- //
+void configurarServidor() {
+
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", htmlPage);
+  });
+
+  server.on("/data", HTTP_GET, []() {
+    String json = "{";
+    json += "\"bpm\":" + String(bpm) + ",";
+    json += "\"beatCount\":" + String(beatCount) + ",";
+    json += "\"electrodes\":\"" + obtenerEstadoElectrodos() + "\",";
+    json += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
+    json += "\"samples\":" + generarBufferJSON();
+    json += "}";
+
+    server.send(200, "application/json", json);
+
+    // Limpia el buffer enviado, pero NO borra BPM ni beatCount
+    bufferIndex = 0;
+    bufferFull = false;
+  });
+
+  server.on("/reset-wifi", HTTP_POST, []() {
+    server.send(200, "application/json", "{\"message\":\"Reiniciando WiFi...\"}");
+
+    delay(1000);
+
+    WiFiManager wm;
+    wm.resetSettings();
+    ESP.restart();
+  });
+}
+
+// -------- CONVERTIR BUFFER A JSON -------- //
+String generarBufferJSON() {
+  String json = "[";
+
+  int count = bufferFull ? BUFFER_SIZE : bufferIndex;
+
+  for (int i = 0; i < count; i++) {
+    json += String(ecgBuffer[i]);
+
+    if (i < count - 1) {
+      json += ",";
+    }
+  }
+
+  json += "]";
+  return json;
+}
+
+// -------- DETECCIÓN DE LATIDOS -------- //
+void detectarLatido(int value) {
+  unsigned long now = millis();
+
+  if (value > threshold && !aboveThreshold) {
+    aboveThreshold = true;
+
+    unsigned long interval = now - lastBeat;
+
+    if (interval > 300 && interval < 2000) {
+      bpm = 60000 / interval;
+      beatCount++;
+    }
+
+    lastBeat = now;
+  }
+
+  if (value < threshold - 200) {
+    aboveThreshold = false;
+  }
+}
+
+// -------- ELECTRODOS -------- //
+String obtenerEstadoElectrodos() {
+  if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+    return "Desconectados";
+  }
+
+  return "Conectados";
+}
+
+// -------- RESET FÍSICO -------- //
+void verificarBotonResetWiFi() {
+  if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+    delay(3000);
+
+    if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+      WiFiManager wm;
+      wm.resetSettings();
+      ESP.restart();
+    }
+  }
+}
