@@ -1,0 +1,192 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h> // Librería clave
+
+// -------- ECG -------- //
+#define ECG_PIN 34
+#define LO_PLUS 32
+#define LO_MINUS 33
+
+WebServer server(80);
+
+// Variables
+int ecgValue = 0;
+int bpm = 0;
+unsigned long lastBeat = 0;
+int threshold = 2200;
+bool aboveThreshold = false;
+
+// -------- DECLARACIÓN -------- //
+void detectarLatido(int value);
+
+// -------- HTML -------- //
+String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Holter ECG</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body style="font-family: Arial; text-align:center; background:#0f172a; color:white;">
+
+<h2>HOLTER ECG</h2>
+
+<p><b>BPM:</b> <span id="bpm">0</span></p>
+<p><b>Estado:</b> <span id="status">OK</span></p>
+<p><b>Tiempo:</b> <span id="uptime">0</span> s</p>
+
+<canvas id="ecgChart" width="300" height="150"></canvas>
+
+<br><br>
+<button onclick="resetWiFi()" style="padding:10px; background:red; color:white; border:none; border-radius:8px;">
+  Restablecer WiFi
+</button>
+
+<script>
+let chart;
+
+const initChart = () => {
+  const ctx = document.getElementById('ecgChart').getContext('2d');
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'ECG',
+        data: [],
+        borderColor: 'lime',
+        borderWidth: 1,
+        fill: false,
+        tension: 0
+      }]
+    },
+    options: {
+      animation: false,
+      scales: {
+        x: { display: false },
+        y: { min: 0, max: 4095 }
+      }
+    }
+  });
+};
+
+const updateData = () => {
+  fetch("/data")
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById("bpm").innerText = data.bpm;
+      document.getElementById("status").innerText = data.electrodes;
+      document.getElementById("uptime").innerText = data.uptime;
+
+      chart.data.labels.push("");
+      chart.data.datasets[0].data.push(data.ecg);
+
+      if (chart.data.labels.length > 120) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+
+      chart.update();
+    });
+};
+
+const resetWiFi = () => {
+  if (confirm("Deseas borrar la configuracion WiFi?")) {
+    fetch("/reset-wifi", { method: "POST" })
+      .then(res => res.json())
+      .then(data => alert(data.message));
+  }
+};
+
+window.onload = () => {
+  initChart();
+  setInterval(updateData, 50);
+};
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// -------- SETUP -------- //
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+
+  // -------- WiFiManager -------- //
+  WiFiManager wm;
+
+  // Si quieres resetear credenciales:
+  // wm.resetSettings();
+
+  bool res = wm.autoConnect("Holter-ECG", "12345678");
+
+  if(!res) {
+    Serial.println("Error al conectar WiFi");
+    ESP.restart();
+  }
+
+  Serial.println("Conectado a WiFi");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // -------- RUTAS WEB -------- //
+  server.on("/", []() {
+    server.send(200, "text/html", htmlPage);
+  });
+
+  server.on("/data", []() {
+    String status = "OK";
+
+    if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+      status = "Electrodos desconectados";
+    }
+
+    String json = "{";
+    json += "\"ecg\":" + String(ecgValue) + ",";
+    json += "\"bpm\":" + String(bpm) + ",";
+    json += "\"status\":\"" + status + "\"";
+    json += "}";
+
+    server.send(200, "application/json", json);
+  });
+
+  server.begin();
+}
+
+// -------- LOOP -------- //
+void loop() {
+  server.handleClient();
+
+  ecgValue = analogRead(ECG_PIN);
+
+  detectarLatido(ecgValue);
+
+  delay(4);
+}
+
+// -------- BPM -------- //
+void detectarLatido(int value) {
+  unsigned long now = millis();
+
+  if (value > threshold && !aboveThreshold) {
+    aboveThreshold = true;
+
+    unsigned long interval = now - lastBeat;
+
+    if (interval > 300 && interval < 2000) {
+      bpm = 60000 / interval;
+    }
+
+    lastBeat = now;
+  }
+
+  if (value < threshold - 200) {
+    aboveThreshold = false;
+  }
+}
