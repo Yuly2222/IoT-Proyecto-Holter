@@ -1,0 +1,502 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// -------- PINES -------- //
+#define ECG_PIN 34
+#define LO_PLUS 32
+#define LO_MINUS 33
+#define RESET_WIFI_BUTTON 25
+
+// -------- OLED -------- //
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+int xPos = 0;
+
+// -------- SERVIDOR WEB -------- //
+WebServer server(80);
+
+// -------- MQTT -------- //
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Cambia esta IP por la IP de tu broker MQTT
+const char* MQTT_SERVER = "broker.hivemq.com";
+const int MQTT_PORT = 1883;
+// 8883 Certificado
+
+const char* MQTT_CLIENT_ID = "holter_ecg_esp32";
+
+const char* TOPIC_ECG = "holter/ecg/value";
+const char* TOPIC_BPM = "holter/ecg/bpm";
+const char* TOPIC_BEATS = "holter/ecg/beatCount";
+const char* TOPIC_ELECTRODES = "holter/ecg/electrodes";
+const char* TOPIC_UPTIME = "holter/ecg/uptime";
+
+unsigned long lastMqttPublish = 0;
+const unsigned long MQTT_INTERVAL_MS = 500;
+
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 3000;
+
+// -------- VARIABLES ECG -------- //
+int ecgValue = 0;
+int bpm = 0;
+
+unsigned long lastBeat = 0;
+int threshold = 2200;
+bool aboveThreshold = false;
+
+int beatCount = 0;
+unsigned long startTime = 0;
+
+// -------- BUFFER ECG -------- //
+#define BUFFER_SIZE 120
+
+int ecgBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1;
+
+// -------- DECLARACIONES -------- //
+void detectarLatido(int value);
+void configurarServidor();
+void verificarBotonResetWiFi();
+String obtenerEstadoElectrodos();
+void tomarMuestraECG();
+String generarBufferJSON();
+void actualizarOLED(int ecgValue);
+void mostrarElectrodosDesconectadosOLED();
+
+void configurarMQTT();
+void reconectarMQTT();
+void publicarMQTT();
+
+// -------- HTML -------- //
+String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Holter ECG</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  font-family: Arial;
+  background: #0f172a;
+  color: white;
+  text-align: center;
+}
+
+.dashboard {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.card {
+  background: #1e293b;
+  margin: 10px;
+  padding: 15px;
+  border-radius: 12px;
+  width: 150px;
+}
+
+.value {
+  font-size: 32px;
+  font-weight: bold;
+  color: #22c55e;
+}
+
+.chart-card {
+  background: #020617;
+  margin: 10px auto;
+  padding: 10px;
+  border-radius: 12px;
+  max-width: 700px;
+}
+
+button {
+  padding: 10px;
+  background: red;
+  color: white;
+  border: none;
+  border-radius: 8px;
+}
+</style>
+</head>
+
+<body>
+
+<h2>HOLTER ECG</h2>
+
+<div class="dashboard">
+  <div class="card">
+    <p>BPM</p>
+    <div class="value"><span id="bpm">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Pulsaciones</p>
+    <div class="value"><span id="beatCount">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Electrodos</p>
+    <div id="status">OK</div>
+  </div>
+
+  <div class="card">
+    <p>Tiempo</p>
+    <div><span id="uptime">0</span> s</div>
+  </div>
+</div>
+
+<div class="chart-card">
+  <canvas id="ecgChart" width="650" height="260"></canvas>
+</div>
+
+<button onclick="resetWiFi()">Reset WiFi</button>
+
+<script>
+let chart;
+let requesting = false;
+
+const MAX_POINTS = 240;
+
+const initChart = () => {
+  const ctx = document.getElementById('ecgChart').getContext('2d');
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'ECG',
+        data: [],
+        borderColor: 'lime',
+        borderWidth: 1,
+        fill: false,
+        tension: 0,
+        pointRadius: 0
+      }]
+    },
+    options: {
+      animation: false,
+      responsive: true,
+      scales: {
+        x: { display: false },
+        y: { min: 0, max: 4095 }
+      }
+    }
+  });
+};
+
+const updateData = () => {
+  if (requesting) return;
+  requesting = true;
+
+  fetch("/data")
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById("bpm").innerText = data.bpm;
+      document.getElementById("beatCount").innerText = data.beatCount;
+      document.getElementById("status").innerText = data.electrodes;
+      document.getElementById("uptime").innerText = data.uptime;
+
+      data.samples.forEach(value => {
+        chart.data.labels.push("");
+        chart.data.datasets[0].data.push(value);
+      });
+
+      while (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+
+      chart.update("none");
+    })
+    .finally(() => {
+      requesting = false;
+    });
+};
+
+const resetWiFi = () => {
+  fetch("/reset-wifi", { method: "POST" })
+    .then(res => res.json())
+    .then(data => alert(data.message));
+};
+
+window.onload = () => {
+  initChart();
+  updateData();
+  setInterval(updateData, 500);
+};
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// -------- SETUP -------- //
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+  pinMode(RESET_WIFI_BUTTON, INPUT_PULLUP);
+
+  startTime = millis();
+
+  // OLED I2C
+  Wire.begin(21, 22);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error al iniciar OLED");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("Ok");
+  display.display();
+
+  delay(1000);
+  display.clearDisplay();
+
+  // WiFiManager
+  WiFiManager wm;
+  bool res = wm.autoConnect("Holter-ECG", "12345678");
+
+  if (!res) {
+    ESP.restart();
+  }
+
+  Serial.print("IP ESP32: ");
+  Serial.println(WiFi.localIP());
+
+  configurarMQTT();
+
+  configurarServidor();
+  server.begin();
+}
+
+// -------- LOOP -------- //
+void loop() {
+  server.handleClient();
+  verificarBotonResetWiFi();
+
+  if (!mqttClient.connected()) {
+    reconectarMQTT();
+  }
+
+  mqttClient.loop();
+
+  tomarMuestraECG();
+  publicarMQTT();
+}
+
+// -------- MQTT -------- //
+void configurarMQTT() {
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+}
+
+void reconectarMQTT() {
+  unsigned long now = millis();
+
+  if (now - lastMqttReconnectAttempt >= MQTT_RECONNECT_INTERVAL_MS) {
+    lastMqttReconnectAttempt = now;
+
+    Serial.print("Conectando a MQTT... ");
+
+    if (mqttClient.connect(MQTT_CLIENT_ID)) {
+      Serial.println("Conectado");
+    } else {
+      Serial.print("Error MQTT, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+
+void publicarMQTT() {
+  unsigned long now = millis();
+
+  if (mqttClient.connected() && now - lastMqttPublish >= MQTT_INTERVAL_MS) {
+    lastMqttPublish = now;
+
+    mqttClient.publish(TOPIC_ECG, String(ecgValue).c_str());
+    mqttClient.publish(TOPIC_BPM, String(bpm).c_str());
+    mqttClient.publish(TOPIC_BEATS, String(beatCount).c_str());
+    mqttClient.publish(TOPIC_ELECTRODES, obtenerEstadoElectrodos().c_str());
+    mqttClient.publish(TOPIC_UPTIME, String((millis() - startTime) / 1000).c_str());
+
+    Serial.println("Datos publicados por MQTT");
+  }
+}
+
+// -------- TOMA DE MUESTRAS -------- //
+void tomarMuestraECG() {
+  unsigned long now = millis();
+
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = now;
+
+    if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+      mostrarElectrodosDesconectadosOLED();
+      return;
+    }
+
+    ecgValue = analogRead(ECG_PIN);
+    detectarLatido(ecgValue);
+
+    ecgBuffer[bufferIndex] = ecgValue;
+    bufferIndex++;
+
+    if (bufferIndex >= BUFFER_SIZE) {
+      bufferIndex = 0;
+      bufferFull = true;
+    }
+
+    actualizarOLED(ecgValue);
+  }
+}
+
+// -------- OLED ECG -------- //
+void actualizarOLED(int ecgValue) {
+  int y = map(ecgValue, 0, 4095, SCREEN_HEIGHT, 0);
+
+  display.drawPixel(xPos, y, SSD1306_WHITE);
+
+  xPos++;
+
+  if (xPos >= SCREEN_WIDTH) {
+    xPos = 0;
+    display.clearDisplay();
+  }
+
+  display.display();
+}
+
+void mostrarElectrodosDesconectadosOLED() {
+  display.clearDisplay();
+
+  display.setCursor(0, 20);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.println("Electrodos");
+  display.println("desconectados");
+
+  display.display();
+
+  delay(300);
+}
+
+// -------- SERVIDOR -------- //
+void configurarServidor() {
+
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", htmlPage);
+  });
+
+  server.on("/data", HTTP_GET, []() {
+    String json = "{";
+    json += "\"bpm\":" + String(bpm) + ",";
+    json += "\"beatCount\":" + String(beatCount) + ",";
+    json += "\"electrodes\":\"" + obtenerEstadoElectrodos() + "\",";
+    json += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
+    json += "\"samples\":" + generarBufferJSON();
+    json += "}";
+
+    server.send(200, "application/json", json);
+
+    bufferIndex = 0;
+    bufferFull = false;
+  });
+
+  server.on("/reset-wifi", HTTP_POST, []() {
+    server.send(200, "application/json", "{\"message\":\"Reiniciando WiFi...\"}");
+
+    delay(1000);
+
+    WiFiManager wm;
+    wm.resetSettings();
+    ESP.restart();
+  });
+}
+
+// -------- BUFFER A JSON -------- //
+String generarBufferJSON() {
+  String json = "[";
+
+  int count = bufferFull ? BUFFER_SIZE : bufferIndex;
+
+  for (int i = 0; i < count; i++) {
+    json += String(ecgBuffer[i]);
+
+    if (i < count - 1) {
+      json += ",";
+    }
+  }
+
+  json += "]";
+  return json;
+}
+
+// -------- LATIDOS -------- //
+void detectarLatido(int value) {
+  unsigned long now = millis();
+
+  if (value > threshold && !aboveThreshold) {
+    aboveThreshold = true;
+
+    unsigned long interval = now - lastBeat;
+
+    if (interval > 300 && interval < 2000) {
+      bpm = 60000 / interval;
+      beatCount++;
+    }
+
+    lastBeat = now;
+  }
+
+  if (value < threshold - 200) {
+    aboveThreshold = false;
+  }
+}
+
+// -------- ELECTRODOS -------- //
+String obtenerEstadoElectrodos() {
+  if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+    return "Desconectados";
+  }
+
+  return "Conectados";
+}
+
+// -------- RESET FÍSICO -------- //
+void verificarBotonResetWiFi() {
+  if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+    delay(3000);
+
+    if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+      WiFiManager wm;
+      wm.resetSettings();
+      ESP.restart();
+    }
+  }
+}
