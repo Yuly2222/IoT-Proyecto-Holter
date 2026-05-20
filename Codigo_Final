@@ -1,0 +1,759 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+
+// ================= PINES =================
+#define ECG_PIN 34
+#define LO_PLUS 32
+#define LO_MINUS 33
+#define RESET_WIFI_BUTTON 25
+
+// ================= OLED =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+int xPos = 0;
+
+// ================= WEB SERVER =================
+WebServer server(80);
+
+// ================= MQTT TLS =================
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+// Broker MQTT con TLS
+// Puedes cambiarlo por tu broker propio Mosquitto con TLS
+const char* MQTT_SERVER = "broker.hivemq.com";
+const int MQTT_PORT = 8883;
+
+const char* MQTT_CLIENT_ID = "holter_ecg_esp32";
+
+// Tópicos MQTT
+const char* TOPIC_ECG = "holter/ecg/value";
+const char* TOPIC_BPM = "holter/ecg/bpm";
+const char* TOPIC_BEATS = "holter/ecg/beatCount";
+const char* TOPIC_ELECTRODES = "holter/ecg/electrodes";
+const char* TOPIC_UPTIME = "holter/ecg/uptime";
+const char* TOPIC_TIMESTAMP = "holter/ecg/timestamp";
+const char* TOPIC_STATUS = "holter/ecg/status";
+
+unsigned long lastMqttPublish = 0;
+const unsigned long MQTT_INTERVAL_MS = 500;
+
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 3000;
+
+// ================= NTP =================
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -5 * 3600;   // Colombia UTC-5
+const int daylightOffset_sec = 0;
+
+// ================= ECG =================
+int ecgValue = 0;
+int bpm = 0;
+
+unsigned long lastBeat = 0;
+int threshold = 2200;
+bool aboveThreshold = false;
+
+int beatCount = 0;
+unsigned long startTime = 0;
+
+// ================= BUFFER =================
+#define BUFFER_SIZE 120
+
+int ecgBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1;
+
+// ================= DECLARACIONES =================
+void configurarOLED();
+void configurarWiFi();
+void configurarMQTT();
+void configurarNTP();
+void configurarServidor();
+
+void reconectarMQTT();
+void publicarMQTT();
+void publicarEstadoMQTT();
+
+void tomarMuestraECG();
+void detectarLatido(int value);
+void actualizarOLED(int value);
+void mostrarElectrodosDesconectadosOLED();
+
+String obtenerEstadoElectrodos();
+String obtenerTimestamp();
+String generarPayloadJSON();
+void verificarBotonResetWiFi();
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+  pinMode(RESET_WIFI_BUTTON, INPUT_PULLUP);
+
+  startTime = millis();
+
+  configurarOLED();
+  configurarWiFi();
+  configurarNTP();
+  configurarMQTT();
+  configurarServidor();
+
+  server.begin();
+
+  Serial.println("Sistema iniciado correctamente");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+  verificarBotonResetWiFi();
+
+  if (!mqttClient.connected()) {
+    reconectarMQTT();
+  }
+
+  mqttClient.loop();
+
+  tomarMuestraECG();
+  publicarMQTT();
+}
+
+// ================= OLED =================
+void configurarOLED() {
+  Wire.begin(21, 22);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error al iniciar OLED");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("Holter ECG");
+  display.println("Iniciando...");
+  display.display();
+
+  delay(1000);
+  display.clearDisplay();
+}
+
+// ================= WIFI =================
+void configurarWiFi() {
+  WiFiManager wm;
+
+  bool res = wm.autoConnect("Holter-ECG", "12345678");
+
+  if (!res) {
+    Serial.println("No se pudo conectar al WiFi");
+    ESP.restart();
+  }
+
+  Serial.print("WiFi conectado. IP ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= NTP =================
+void configurarNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  Serial.print("Sincronizando hora NTP");
+
+  struct tm timeinfo;
+  int intentos = 0;
+
+  while (!getLocalTime(&timeinfo) && intentos < 10) {
+    Serial.print(".");
+    delay(1000);
+    intentos++;
+  }
+
+  if (getLocalTime(&timeinfo)) {
+    Serial.println("\nHora sincronizada correctamente");
+    Serial.println(obtenerTimestamp());
+  } else {
+    Serial.println("\nNo se pudo sincronizar NTP");
+  }
+}
+
+String obtenerTimestamp() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+    return "NTP_NOT_SYNCED";
+  }
+
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+  return String(buffer);
+}
+
+// ================= MQTT TLS =================
+void configurarMQTT() {
+  /*
+    Esto activa TLS, pero no valida certificado.
+    Para una entrega más segura, lo ideal es usar:
+    secureClient.setCACert(root_ca);
+  */
+  secureClient.setInsecure();
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+
+  Serial.println("MQTT TLS configurado");
+}
+
+void reconectarMQTT() {
+  unsigned long now = millis();
+
+  if (now - lastMqttReconnectAttempt >= MQTT_RECONNECT_INTERVAL_MS) {
+    lastMqttReconnectAttempt = now;
+
+    Serial.print("Conectando a broker MQTT TLS... ");
+
+    if (mqttClient.connect(MQTT_CLIENT_ID)) {
+      Serial.println("Conectado");
+
+      publicarEstadoMQTT();
+    } else {
+      Serial.print("Error MQTT, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+
+void publicarMQTT() {
+  unsigned long now = millis();
+
+  if (mqttClient.connected() && now - lastMqttPublish >= MQTT_INTERVAL_MS) {
+    lastMqttPublish = now;
+
+    mqttClient.publish(TOPIC_ECG, String(ecgValue).c_str());
+    mqttClient.publish(TOPIC_BPM, String(bpm).c_str());
+    mqttClient.publish(TOPIC_BEATS, String(beatCount).c_str());
+    mqttClient.publish(TOPIC_ELECTRODES, obtenerEstadoElectrodos().c_str());
+    mqttClient.publish(TOPIC_UPTIME, String((millis() - startTime) / 1000).c_str());
+    mqttClient.publish(TOPIC_TIMESTAMP, obtenerTimestamp().c_str());
+
+    String payload = generarPayloadJSON();
+    mqttClient.publish("holter/ecg/json", payload.c_str());
+
+    Serial.println("Datos publicados por MQTT TLS");
+  }
+}
+
+void publicarEstadoMQTT() {
+  String status = "{";
+  status += "\"device\":\"ESP32 Holter ECG\",";
+  status += "\"status\":\"online\",";
+  status += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  status += "\"mqtt\":\"connected\",";
+  status += "\"tls\":\"enabled\",";
+  status += "\"timestamp\":\"" + obtenerTimestamp() + "\"";
+  status += "}";
+
+  mqttClient.publish(TOPIC_STATUS, status.c_str(), true);
+}
+
+// ================= PAYLOAD JSON =================
+String generarPayloadJSON() {
+  String json = "{";
+  json += "\"ecg\":" + String(ecgValue) + ",";
+  json += "\"bpm\":" + String(bpm) + ",";
+  json += "\"beatCount\":" + String(beatCount) + ",";
+  json += "\"electrodes\":\"" + obtenerEstadoElectrodos() + "\",";
+  json += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
+  json += "\"timestamp\":\"" + obtenerTimestamp() + "\",";
+  json += "\"mqtt_tls\":true";
+  json += "}";
+
+  return json;
+}
+
+// ================= SERVIDOR WEB =================
+void configurarServidor() {
+
+  server.on("/", HTTP_GET, []() {
+    String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Holter ECG MQTT TLS</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #0f172a;
+  color: white;
+  text-align: center;
+  margin: 0;
+  padding: 20px;
+}
+
+h1 {
+  color: #38bdf8;
+}
+
+.alert-mqtt {
+  background: #064e3b;
+  color: #d1fae5;
+  padding: 12px;
+  border-radius: 10px;
+  margin: 10px auto;
+  max-width: 750px;
+  font-weight: bold;
+}
+
+.alert-warning {
+  background: #78350f;
+  color: #ffedd5;
+  padding: 12px;
+  border-radius: 10px;
+  margin: 10px auto 20px auto;
+  max-width: 750px;
+}
+
+.dashboard {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.card {
+  background: #1e293b;
+  margin: 10px;
+  padding: 15px;
+  border-radius: 12px;
+  width: 170px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+.card p {
+  margin: 0 0 8px 0;
+  color: #cbd5e1;
+}
+
+.value {
+  font-size: 32px;
+  font-weight: bold;
+  color: #22c55e;
+}
+
+.status-ok {
+  color: #22c55e;
+  font-weight: bold;
+}
+
+.status-bad {
+  color: #ef4444;
+  font-weight: bold;
+}
+
+.chart-card {
+  background: #020617;
+  margin: 20px auto;
+  padding: 15px;
+  border-radius: 12px;
+  max-width: 760px;
+}
+
+button {
+  padding: 10px 16px;
+  background: #dc2626;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #b91c1c;
+}
+
+.footer {
+  margin-top: 20px;
+  color: #94a3b8;
+  font-size: 14px;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Holter ECG - ESP32</h1>
+
+<div class="alert-mqtt">
+  Los datos del ECG están siendo publicados por MQTT TLS hacia el broker configurado.
+</div>
+
+<div class="alert-warning">
+  Este dashboard local es solo para monitoreo/debug.
+  El backend o dashboard principal debe consumir los datos desde el broker MQTT.
+</div>
+
+<div class="dashboard">
+
+  <div class="card">
+    <p>BPM</p>
+    <div class="value"><span id="bpm">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Pulsaciones</p>
+    <div class="value"><span id="beatCount">0</span></div>
+  </div>
+
+  <div class="card">
+    <p>Electrodos</p>
+    <div id="electrodes" class="status-ok">---</div>
+  </div>
+
+  <div class="card">
+    <p>Tiempo activo</p>
+    <div><span id="uptime">0</span> s</div>
+  </div>
+
+  <div class="card">
+    <p>MQTT</p>
+    <div id="mqttStatus" class="status-bad">---</div>
+  </div>
+
+  <div class="card">
+    <p>TLS</p>
+    <div class="status-ok">Activo</div>
+  </div>
+
+  <div class="card">
+    <p>Hora NTP</p>
+    <div id="timestamp" style="font-size:14px;">
+      ---
+    </div>
+  </div>
+
+</div>
+
+<div class="chart-card">
+  <canvas id="ecgChart" width="700" height="280"></canvas>
+</div>
+
+<button onclick="resetWiFi()">Reset WiFi</button>
+
+<div class="footer">
+  <p>Healthcheck disponible en: <strong>/health</strong></p>
+  <p>Datos publicados en tópicos MQTT: <strong>holter/ecg/#</strong></p>
+</div>
+
+<script>
+
+let chart;
+let requesting = false;
+
+const MAX_POINTS = 240;
+
+function initChart() {
+
+  const ctx = document.getElementById('ecgChart').getContext('2d');
+
+  chart = new Chart(ctx, {
+    type: 'line',
+
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Señal ECG',
+        data: [],
+        borderColor: 'lime',
+        borderWidth: 1,
+        fill: false,
+        tension: 0,
+        pointRadius: 0
+      }]
+    },
+
+    options: {
+      animation: false,
+      responsive: true,
+
+      scales: {
+        x: {
+          display: false
+        },
+
+        y: {
+          min: 0,
+          max: 4095
+        }
+      },
+
+      plugins: {
+        legend: {
+          labels: {
+            color: 'white'
+          }
+        }
+      }
+    }
+  });
+}
+
+function updateData() {
+
+  if (requesting) return;
+
+  requesting = true;
+
+  fetch("/status")
+    .then(response => response.json())
+
+    .then(data => {
+
+      document.getElementById("bpm").innerText =
+        data.bpm ?? 0;
+
+      document.getElementById("beatCount").innerText =
+        data.beatCount ?? 0;
+
+      document.getElementById("uptime").innerText =
+        data.uptime ?? 0;
+
+      document.getElementById("timestamp").innerText =
+        data.timestamp ?? "---";
+
+      const electrodes =
+        document.getElementById("electrodes");
+
+      electrodes.innerText =
+        data.electrodes ?? "---";
+
+      if (data.electrodes === "Conectados") {
+        electrodes.className = "status-ok";
+      } else {
+        electrodes.className = "status-bad";
+      }
+
+      const mqttStatus =
+        document.getElementById("mqttStatus");
+
+      mqttStatus.innerText =
+        data.mqtt_tls ? "TLS" : "No TLS";
+
+      mqttStatus.className =
+        data.mqtt_tls ? "status-ok" : "status-bad";
+
+      if (data.ecg !== undefined) {
+
+        chart.data.labels.push("");
+
+        chart.data.datasets[0].data.push(data.ecg);
+
+        while (chart.data.labels.length > MAX_POINTS) {
+          chart.data.labels.shift();
+          chart.data.datasets[0].data.shift();
+        }
+
+        chart.update("none");
+      }
+    })
+
+    .catch(error => {
+      console.log("Error consultando /status:", error);
+    })
+
+    .finally(() => {
+      requesting = false;
+    });
+}
+
+function resetWiFi() {
+
+  fetch("/reset-wifi", {
+    method: "POST"
+  })
+
+  .then(response => response.json())
+
+  .then(data => {
+    alert(data.message);
+  })
+
+  .catch(error => {
+    alert("Error reiniciando WiFi");
+  });
+}
+
+window.onload = function() {
+
+  initChart();
+
+  updateData();
+
+  setInterval(updateData, 500);
+};
+
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+    server.send(200, "text/html", htmlPage);
+  });
+
+  server.on("/health", HTTP_GET, []() {
+    String json = "{";
+    json += "\"status\":\"ok\",";
+    json += "\"device\":\"ESP32 Holter ECG\",";
+    json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected") + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"mqtt\":\"" + String(mqttClient.connected() ? "connected" : "disconnected") + "\",";
+    json += "\"mqtt_tls\":true,";
+    json += "\"broker\":\"" + String(MQTT_SERVER) + "\",";
+    json += "\"port\":" + String(MQTT_PORT) + ",";
+    json += "\"ntp_time\":\"" + obtenerTimestamp() + "\",";
+    json += "\"electrodes\":\"" + obtenerEstadoElectrodos() + "\",";
+    json += "\"uptime\":" + String((millis() - startTime) / 1000);
+    json += "}";
+
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/status", HTTP_GET, []() {
+    String json = generarPayloadJSON();
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/reset-wifi", HTTP_POST, []() {
+    server.send(200, "application/json", "{\"message\":\"Reiniciando WiFi...\"}");
+
+    delay(1000);
+
+    WiFiManager wm;
+    wm.resetSettings();
+    ESP.restart();
+  });
+}
+
+// ================= ECG =================
+void tomarMuestraECG() {
+  unsigned long now = millis();
+
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = now;
+
+    if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+      mostrarElectrodosDesconectadosOLED();
+      return;
+    }
+
+    ecgValue = analogRead(ECG_PIN);
+
+    detectarLatido(ecgValue);
+
+    ecgBuffer[bufferIndex] = ecgValue;
+    bufferIndex++;
+
+    if (bufferIndex >= BUFFER_SIZE) {
+      bufferIndex = 0;
+      bufferFull = true;
+    }
+
+    actualizarOLED(ecgValue);
+  }
+}
+
+void detectarLatido(int value) {
+  unsigned long now = millis();
+
+  if (value > threshold && !aboveThreshold) {
+    aboveThreshold = true;
+
+    unsigned long interval = now - lastBeat;
+
+    if (interval > 300 && interval < 2000) {
+      bpm = 60000 / interval;
+      beatCount++;
+    }
+
+    lastBeat = now;
+  }
+
+  if (value < threshold - 200) {
+    aboveThreshold = false;
+  }
+}
+
+void actualizarOLED(int value) {
+  int y = map(value, 0, 4095, SCREEN_HEIGHT, 0);
+
+  display.drawPixel(xPos, y, SSD1306_WHITE);
+
+  xPos++;
+
+  if (xPos >= SCREEN_WIDTH) {
+    xPos = 0;
+    display.clearDisplay();
+
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("BPM: ");
+    display.print(bpm);
+
+    display.setCursor(70, 0);
+    display.print("MQTT");
+  }
+
+  display.display();
+}
+
+void mostrarElectrodosDesconectadosOLED() {
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("Electrodos");
+  display.println("desconectados");
+
+  display.display();
+}
+
+// ================= ELECTRODOS =================
+String obtenerEstadoElectrodos() {
+  if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+    return "Desconectados";
+  }
+
+  return "Conectados";
+}
+
+// ================= RESET WIFI =================
+void verificarBotonResetWiFi() {
+  if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+    delay(3000);
+
+    if (digitalRead(RESET_WIFI_BUTTON) == LOW) {
+      WiFiManager wm;
+      wm.resetSettings();
+      ESP.restart();
+    }
+  }
+}
