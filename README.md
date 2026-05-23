@@ -439,5 +439,34 @@ https://youtube.com/shorts/cSvOMIurHtk?si=10aOJ-HlRb1GqgEK
 - Visualización OLED  
 - MQTT operativo  
 - Pruebas del sistema  
-- Healthcheck  
-- Configuración WiFi  
+- Healthcheck
+- Configuración WiFi
+
+# Uso de Memoria y Recursos
+
+El sistema fue desarrollado para ejecutarse en una ESP32, aprovechando recursos limitados de hardware para realizar monitoreo ECG en tiempo real.
+
+## Recursos de la ESP32
+
+| Recurso | Capacidad |
+|---|---|
+| SRAM | ~520 KB |
+| Flash | 4 MB |
+| ADC | 12 bits |
+
+---
+
+# Distribución Aproximada del Uso de Memoria
+
+| Componente | Uso Aproximado |
+|---|---|
+| Variables ECG y BPM | Bajo |
+| Buffer gráfico OLED | Medio |
+| Servidor Web HTTP | Medio |
+| Cliente MQTT TLS | Alto |
+| WiFiManager | Medio |
+| JSON Payload MQTT | Bajo |
+| Chart.js embebido HTML | Alto |
+| Librerías Adafruit SSD1306 | Medio |
+
+
