@@ -5,7 +5,6 @@ Integrantes:
 * Jacobo Andres Pacheco 
 * David Andres Casas 
 
-Los archivos que comprueban de manera fotográfica las rúbricas del proyecto del **TERCER CORTE** (Sin mostrar el puerto 8883) estan el la carpeta de imgs
 ## Visión del Proyecto
 
 Este proyecto consiste en el desarrollo de un **monitor cardíaco tipo Holter de bajo costo**, utilizando una **ESP32 y el sensor AD8232**, capaz de capturar señales ECG en tiempo real y transmitirlas para su visualización y análisis.
