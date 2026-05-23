@@ -416,9 +416,13 @@ Broker IoT
 
 Las evidencias fotográficas y pruebas de cumplimiento de rúbricas del tercer corte se encuentran en:
 
-```text
-/imgs
-```
+![Muestra del montaje con paciente real](imgs/Evidencia1.jpeg)
+
+![Healthcheck funcionando](imgs/Evidencia2.jpeg)
+
+## Video de demostración
+
+https://youtube.com/shorts/cSvOMIurHtk?si=10aOJ-HlRb1GqgEK
 
 ## Archivos de Evidencia
 
