@@ -31,7 +31,7 @@ Este sistema busca ofrecer una alternativa:
 - Proyectos de investigación en IoT y salud  
 
 ## Arquitectura y Restricciones
-![Healthcheck funcionando](imgs/diagrama(2).png)
+![Healthcheck funcionando](imgs/diagrama.png)
 
 # Conexiones del Hardware
 
