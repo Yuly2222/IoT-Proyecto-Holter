@@ -446,27 +446,28 @@ https://youtube.com/shorts/cSvOMIurHtk?si=10aOJ-HlRb1GqgEK
 
 El sistema fue desarrollado para ejecutarse en una ESP32, aprovechando recursos limitados de hardware para realizar monitoreo ECG en tiempo real.
 
-## Recursos de la ESP32
+# Uso de Memoria y Recursos
 
-| Recurso | Capacidad |
+El sistema fue desarrollado para ejecutarse en una ESP32, utilizando recursos limitados para realizar monitoreo ECG, visualización OLED, dashboard web y comunicación MQTT segura en tiempo real.
+
+## Uso Real de Recursos
+
+| Recurso | Uso |
 |---|---|
-| SRAM | ~520 KB |
-| Flash | 4 MB |
-| ADC | 12 bits |
+| Memoria Flash (Programa) | 1,279,425 bytes (97%) |
+| Memoria SRAM Global | 45,904 bytes (14%) |
+| SRAM disponible para variables locales | 281,776 bytes |
 
 ---
 
-# Distribución Aproximada del Uso de Memoria
+## Componentes con Mayor Consumo
 
-| Componente | Uso Aproximado |
-|---|---|
-| Variables ECG y BPM | Bajo |
-| Buffer gráfico OLED | Medio |
-| Servidor Web HTTP | Medio |
-| Cliente MQTT TLS | Alto |
-| WiFiManager | Medio |
-| JSON Payload MQTT | Bajo |
-| Chart.js embebido HTML | Alto |
-| Librerías Adafruit SSD1306 | Medio |
+- Dashboard Web embebido (HTML + Chart.js)  
+- Comunicación MQTT con TLS  
+- WiFiManager  
+- Pantalla OLED SSD1306  
+- Servidor HTTP local  
 
+```cpp
+WiFiClientSecure secureClient;
 
