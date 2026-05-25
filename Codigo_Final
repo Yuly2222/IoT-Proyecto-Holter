@@ -7,6 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include "esp32_cert_bundle.h"
 
 // ================= PINES =================
 #define ECG_PIN 34
@@ -213,7 +214,7 @@ void configurarMQTT() {
     Para una entrega más segura, lo ideal es usar:
     secureClient.setCACert(root_ca);
   */
-  secureClient.setInsecure();
+  secureClient.setCACertBundle(x509_crt_bundle);
 
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
 
