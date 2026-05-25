@@ -71,6 +71,8 @@ Este sistema busca ofrecer una alternativa:
 - Pantalla OLED SSD1306 128x64  
 - Electrodos ECG desechables  
 
+# ⚙️ Tecnologías Utilizadas
+
 ## Software y Librerías
 
 | Tecnología | Uso |
@@ -79,6 +81,7 @@ Este sistema busca ofrecer una alternativa:
 | WiFiManager | Configuración dinámica WiFi |
 | PubSubClient | Comunicación MQTT |
 | WiFiClientSecure | Comunicación TLS |
+| esp32_cert_bundle | Validación de certificados SSL/TLS |
 | Adafruit SSD1306 | Control OLED |
 | Chart.js | Visualización gráfica web |
 | NTP | Sincronización de tiempo |
@@ -187,29 +190,36 @@ const int MQTT_PORT = 8883;
 
 ## TLS en MQTT
 
-La comunicación MQTT utiliza TLS para cifrar la transmisión de datos.
+La comunicación MQTT utiliza TLS para cifrar la transmisión de datos entre la ESP32 y el broker MQTT.
 
 ```cpp
 WiFiClientSecure secureClient;
 ```
 
-Actualmente:
+Inicialmente se utilizaba:
 
 ```cpp
 secureClient.setInsecure();
 ```
 
-Esto habilita TLS pero sin validación estricta de certificado.
+Sin embargo, el proyecto fue actualizado para implementar validación de certificados utilizando el bundle oficial de certificados raíz de ESP32.
 
-Como mejora futura se propone:
+## Implementación Actual
 
 ```cpp
-secureClient.setCACert(root_ca);
+#include "esp32_cert_bundle.h"
 ```
 
-para autenticación completa del broker.
+```cpp
+secureClient.setCACertBundle(x509_crt_bundle);
+```
 
----
+Esto permite:
+
+- Validación automática de certificados SSL/TLS  
+- Comunicación más segura con el broker MQTT  
+- Prevención de ataques tipo Man-in-the-Middle (MITM)  
+- Uso de certificados raíz integrados en ESP32  
 
 # Sincronización Horaria NTP
 
@@ -338,7 +348,8 @@ Broker IoT
 -  Detección BPM  
 -  Visualización OLED  
 -  Dashboard funcional  
--  Conexión MQTT  
+-  Comunicación MQTT segura (TLS)  
+-  Validación de certificados SSL/TLS  
 -  Sincronización NTP  
 -  Healthcheck operativo  
 -  Reconexión MQTT automática  
